@@ -105,6 +105,38 @@ def get_args_parser():
 # Main
 # ---------------------------------------------------------------------------
 
+def save_lora_only(args, model, epoch):
+    """Save a small LoRA-only checkpoint (LoRA tensors + font embedding + SN buffers + meta)."""
+    import re
+    state_dict = model.state_dict()
+    lora_sd = {k: v for k, v in state_dict.items() if "lora_" in k}
+    if not lora_sd:
+        return
+    sn_buffers = {k: v for k, v in state_dict.items() if re.search(r"\.(?:u|sv)\d+$", k)}
+    meta = {
+        "base_model": args.model,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "lora_targets": args.lora_targets,
+        "num_fonts": args.num_fonts,
+        "num_chars": args.num_chars,
+        "epoch": epoch,
+        "base_checkpoint": args.base_checkpoint,
+        "cfg": args.cfg,
+        "sampling_method": args.sampling_method,
+        "num_sampling_steps": args.num_sampling_steps,
+        "noise_scale": args.noise_scale,
+    }
+    out = {
+        "lora": lora_sd,
+        "font_embedding": {k: v for k, v in state_dict.items() if "font_embedding" in k},
+        "buffers": sn_buffers,
+        "meta": meta,
+    }
+    torch.save(out, os.path.join(args.output_dir, "checkpoint-lora.pth"))
+
+
 def main(args):
     print("Job directory:", os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(", ", ",\n"))
@@ -123,7 +155,6 @@ def main(args):
 
     transform_train = transforms.Compose([
         transforms.Lambda(lambda img: resize_and_random_crop(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])
 
@@ -235,6 +266,7 @@ def main(args):
                 epoch=epoch,
                 epoch_name="last"
             )
+            save_lora_only(args, model, epoch)
 
         if args.online_eval and epoch > 0 and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()

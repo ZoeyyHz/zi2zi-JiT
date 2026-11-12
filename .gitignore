@@ -52,3 +52,7 @@ events.out.tfevents.*
 # Temp files
 tmp/
 temp/
+# Local large binaries: model weights and training runs
+models/
+run/
+fid_stats/

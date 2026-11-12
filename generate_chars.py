@@ -45,8 +45,12 @@ def get_args_parser():
     parser = argparse.ArgumentParser('JiT Evaluation', add_help=False)
 
     # Required paths
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint (full model incl. LoRA)')
+    parser.add_argument('--base_checkpoint', type=str, default=None,
+                        help='Path to the vanilla base checkpoint to pair with --lora')
+    parser.add_argument('--lora', type=str, default=None,
+                        help='Path to a LoRA-only file (from extract_lora.py); requires --base_checkpoint or infers it from meta')
     parser.add_argument('--test_npz', type=str, required=True,
                         help='Path to test npz file')
     parser.add_argument('--output_dir', type=str, default='./eval_output',
@@ -176,8 +180,57 @@ def main(args):
     print(f"Rank {local_rank}/{world_size}: Initializing on {device}...")
 
     # ============ Load Checkpoint ============
-    print(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    if args.lora:
+        # Base checkpoint + LoRA-only file (see extract_lora.py): merge into an
+        # in-memory LoRA checkpoint and fall through to the regular load path.
+        lora_ckpt = torch.load(args.lora, map_location='cpu', weights_only=False)
+        meta = lora_ckpt['meta']
+        base_path = args.base_checkpoint
+        if base_path is None:
+            arch = meta.get('base_model') or 'JiT-B/16'
+            base_path = 'models/zi2zi-' + arch.replace('/', '-') + '.pth'
+        print(f"Loading base checkpoint from {base_path} + LoRA from {args.lora}")
+        base_ckpt = torch.load(base_path, map_location='cpu', weights_only=False)
+        ckpt_args = base_ckpt['args']
+        if args.model is not None:
+            ckpt_args.model = args.model
+
+        base_arch = getattr(ckpt_args, 'model', 'JiT-B/16')
+        if meta.get('base_model') not in (None, base_arch):
+            raise RuntimeError(
+                f"LoRA was fine-tuned on {meta['base_model']} but base checkpoint is {base_arch}; "
+                "use a matching --base_checkpoint."
+            )
+        # fall back to the LoRA's saved generation defaults when the base args lack them
+        for gen_key in ('cfg', 'sampling_method', 'num_sampling_steps', 'noise_scale'):
+            if getattr(ckpt_args, gen_key, None) is None and meta.get(gen_key) is not None:
+                setattr(ckpt_args, gen_key, meta[gen_key])
+        # expose LoRA hyper-params to the regular injection path below
+        ckpt_args.lora_r = meta['lora_r']
+        ckpt_args.lora_alpha = meta['lora_alpha']
+        ckpt_args.lora_dropout = meta.get('lora_dropout', 0.0)
+        ckpt_args.lora_targets = meta['lora_targets']
+
+        # fine-tuning loads the base's plain 'model' weights; mirror that choice
+        base_sd = base_ckpt['model'] if 'model' in base_ckpt else base_ckpt
+        lora_sd = lora_ckpt['lora']
+        # modules wrapped by LoRA store their base weights under '.base.'
+        wrapped = {k[:-len('.lora_A')] for k in lora_sd if k.endswith('.lora_A')}
+        merged = {}
+        for k, v in base_sd.items():
+            mod, _, leaf = k.rpartition('.')
+            merged[f'{mod}.base.{leaf}' if mod in wrapped else k] = v
+        merged.update(lora_sd)
+        merged.update(lora_ckpt.get('font_embedding', {}))
+        merged.update(lora_ckpt.get('buffers', {}))
+        checkpoint = {'args': ckpt_args, 'model': merged}
+
+    elif not args.checkpoint:
+        raise RuntimeError('Either --checkpoint or --lora must be provided')
+
+    else:
+        print(f"Loading checkpoint from {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
 
     # Get args from checkpoint and override model only when explicitly specified
     ckpt_args = checkpoint['args']
